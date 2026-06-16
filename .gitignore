@@ -1,0 +1,21 @@
+# 第三方参考工程(不上传)
+insightface/
+
+# 编译中间产物 / 构建目录
+build_x86/
+build_cross/
+build_clang/
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# 编译输出
+bin/
+lib/
+
+# 运行时生成的产物
+*_detected.*
+*.faces.json
+data/face_db.json
