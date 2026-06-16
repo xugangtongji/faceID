@@ -54,6 +54,58 @@ std::string EnvOr(const char* key, const std::string& fallback) {
   return (v && *v) ? std::string(v) : fallback;
 }
 
+// ArcFace 112x112 标准模板的 5 个参考关键点(顺序与 YuNet 输出一致:
+// 右眼, 左眼, 鼻尖, 右嘴角, 左嘴角)。
+const cv::Point2f kArcFace112[5] = {
+    {38.2946f, 51.6963f}, {73.5318f, 51.5014f}, {56.0252f, 71.7366f},
+    {41.5493f, 92.3655f}, {70.7299f, 92.2041f}};
+
+// Umeyama: 由若干对应点估计相似变换(旋转 + 统一缩放 + 平移),返回 2x3 仿射矩阵。
+// 参考 Umeyama (1991), 与 ArcFace/insightface 的人脸对齐一致。
+cv::Mat Umeyama(const std::vector<cv::Point2f>& src,
+                const std::vector<cv::Point2f>& dst) {
+  const int n = static_cast<int>(src.size());
+  cv::Point2f mean_src(0, 0), mean_dst(0, 0);
+  for (int i = 0; i < n; ++i) {
+    mean_src += src[i];
+    mean_dst += dst[i];
+  }
+  mean_src *= (1.0f / n);
+  mean_dst *= (1.0f / n);
+
+  cv::Mat H = cv::Mat::zeros(2, 2, CV_64F);  // 协方差 (1/n) Σ (dst-μd)(src-μs)^T
+  double var_src = 0.0;
+  for (int i = 0; i < n; ++i) {
+    cv::Point2f s = src[i] - mean_src, d = dst[i] - mean_dst;
+    H.at<double>(0, 0) += (double)d.x * s.x;
+    H.at<double>(0, 1) += (double)d.x * s.y;
+    H.at<double>(1, 0) += (double)d.y * s.x;
+    H.at<double>(1, 1) += (double)d.y * s.y;
+    var_src += (double)s.x * s.x + (double)s.y * s.y;
+  }
+  H /= n;
+  var_src /= n;
+
+  cv::Mat S, U, Vt;
+  cv::SVD::compute(H, S, U, Vt);
+  cv::Mat D = cv::Mat::eye(2, 2, CV_64F);
+  if (cv::determinant(U) * cv::determinant(Vt) < 0) D.at<double>(1, 1) = -1;
+  cv::Mat R = U * D * Vt;  // 旋转 2x2
+  double scale =
+      (1.0 / var_src) * (S.at<double>(0) * D.at<double>(0, 0) +
+                         S.at<double>(1) * D.at<double>(1, 1));
+
+  cv::Mat M(2, 3, CV_64F);
+  cv::Mat sR = scale * R;
+  sR.copyTo(M(cv::Rect(0, 0, 2, 2)));
+  cv::Mat ms = (cv::Mat_<double>(2, 1) << mean_src.x, mean_src.y);
+  cv::Mat md = (cv::Mat_<double>(2, 1) << mean_dst.x, mean_dst.y);
+  cv::Mat t = md - sR * ms;  // 平移
+  M.at<double>(0, 2) = t.at<double>(0);
+  M.at<double>(1, 2) = t.at<double>(1);
+  return M;
+}
+
 // 将一行特征写成 JSON 数组字符串: [0.1,-0.2,...]
 std::string FeatureToJson(const cv::Mat& feat) {
   std::string s = "[";
@@ -119,23 +171,50 @@ int main(int argc, char** argv) {
   const int n = faces.rows;
   std::cout << "检测到人脸数量: " << n << "\n";
 
-  // 4. 逐张人脸: 对齐裁剪 -> 提取 128 维特征
+  // 5 个关键点的可视化颜色(右眼/左眼/鼻尖/右嘴角/左嘴角)
+  const cv::Scalar kPtColors[5] = {
+      {0, 0, 255}, {0, 255, 255}, {255, 0, 255}, {255, 0, 0}, {0, 255, 0}};
+
+  // 4. 逐张人脸: 取 5 关键点 -> Umeyama 对齐到 112x112 -> 提取 128 维特征
   std::vector<cv::Mat> features;  // 每个为 1x128 float
   features.reserve(n);
   for (int i = 0; i < n; ++i) {
-    cv::Mat aligned;
-    recognizer->alignCrop(image, faces.row(i), aligned);
-    cv::Mat feat;
-    recognizer->feature(aligned, feat);
+    const float* d = faces.ptr<float>(i);
+
+    // YuNet 输出: [x,y,w,h, 右眼(4,5),左眼(6,7),鼻尖(8,9),右嘴角(10,11),左嘴角(12,13), score]
+    std::vector<cv::Point2f> landmarks = {
+        {d[4], d[5]}, {d[6], d[7]}, {d[8], d[9]}, {d[10], d[11]}, {d[12], d[13]}};
+
+    // 用 5 关键点做 Umeyama 相似变换, 把人脸摆正裁到 112x112 标准姿态
+    std::vector<cv::Point2f> tmpl(kArcFace112, kArcFace112 + 5);
+    cv::Mat M = Umeyama(landmarks, tmpl);
+    cv::Mat aligned112;
+    cv::warpAffine(image, aligned112, M, cv::Size(112, 112));
+
+    // 保存 Umeyama 对齐后的 112x112 人脸
+    std::string aligned_path = InsertBeforeExt(input_path, "_aligned_" + std::to_string(i));
+    cv::imwrite(aligned_path, aligned112);
+    std::cout << "对齐人脸已保存: " << aligned_path << " (112x112)\n";
+
+    // 提取 128 维特征(SFace 的 alignCrop 内部同样基于这 5 点做相似变换)
+    cv::Mat sface_aligned, feat;
+    recognizer->alignCrop(image, faces.row(i), sface_aligned);
+    recognizer->feature(sface_aligned, feat);
     features.push_back(feat.clone());  // feature() 复用内部缓冲, 必须 clone
 
     // 绘制检测框 + 序号
-    const float* d = faces.ptr<float>(i);
     cv::Rect box(cvRound(d[0]), cvRound(d[1]), cvRound(d[2]), cvRound(d[3]));
     cv::rectangle(image, box, cv::Scalar(0, 255, 0), 2);
     cv::putText(image, std::to_string(i + 1),
                 cv::Point(box.x, std::max(box.y - 6, 12)),
                 cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+
+    // 绘制 5 个关键点(不同颜色 + 序号)
+    for (int k = 0; k < 5; ++k) {
+      cv::circle(image, landmarks[k], 2, kPtColors[k], -1);
+      cv::putText(image, std::to_string(k), landmarks[k] + cv::Point2f(3, -3),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.35, kPtColors[k], 1);
+    }
   }
 
   // 5. 保存标注图

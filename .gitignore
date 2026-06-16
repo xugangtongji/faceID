@@ -19,3 +19,7 @@ lib/
 *_detected.*
 *.faces.json
 data/face_db.json
+data/face_db_isf.json
+
+# InspireFace 构建日志
+isf_*.log

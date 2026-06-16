@@ -64,4 +64,23 @@ if(NOT ${ENABLE_CROSSCOMPILE})
     add_executable(face_register src/face_register.cc)
     target_include_directories(face_register PRIVATE ${FACE_INCLUDE_DIRS})
     target_link_libraries(face_register ${OpenCV_LIBS})
+
+    # face_register_isf: InspireFace(MNN/CPU) 版的注册+识别, 用于与上面对比效果。
+    # 需先编译 InspireFace SDK(见 README)。可用 -DISF_ROOT= 指定 SDK 安装目录。
+    set(ISF_ROOT
+        "${CMAKE_CURRENT_SOURCE_DIR}/insightface/cpp-package/inspireface/build/inspireface-linux-x86-ubuntu18/InspireFace"
+        CACHE PATH "InspireFace SDK install root (include/ and lib/)")
+    if(EXISTS ${ISF_ROOT}/include/inspireface/inspireface.hpp)
+        message(STATUS "InspireFace SDK: ${ISF_ROOT}")
+        add_executable(face_register_isf src/face_register_isf.cpp)
+        target_include_directories(face_register_isf PRIVATE
+            ${FACE_INCLUDE_DIRS} ${ISF_ROOT}/include)
+        target_link_libraries(face_register_isf
+            ${ISF_ROOT}/lib/libInspireFace.so ${OpenCV_LIBS})
+        set_target_properties(face_register_isf PROPERTIES
+            BUILD_RPATH ${ISF_ROOT}/lib
+            INSTALL_RPATH ${ISF_ROOT}/lib)
+    else()
+        message(STATUS "未找到 InspireFace SDK(${ISF_ROOT}), 跳过 face_register_isf")
+    endif()
 endif()
